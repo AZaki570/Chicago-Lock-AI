@@ -1,0 +1,477 @@
+# Chicago Lock AI Project — Inference Pipeline
+# Runs all 3 models on a single image and feeds outputs into reasoning layer
+# Uses COCO pretrained YOLOv8 for waiting zone boat counting
+
+from ultralytics import YOLO
+from pathlib import Path
+from PIL import Image, ImageStat, ImageEnhance
+import sys
+import os
+
+sys.path.append(os.path.dirname(__file__))
+from reasoning_layer import classify_lock_state, OPEN, CLOSED, PARTIAL, TOWARD_RIVER, TOWARD_LAKE
+
+# ─── MODEL PATHS ──────────────────────────────────────────────────────────────
+
+BASE = Path("/Users/ahmedzaki/Desktop/Chicago Lock AI Project")
+
+GATE_MODEL_PATH        = BASE / "runs/classify/gate_classifier_results/gate_model_v1/weights/best.pt"
+ORIENTATION_MODEL_PATH = BASE / "runs/classify/orientation_model_v1/weights/best.pt"
+BOAT_MODEL_PATH        = BASE / "runs/segment/boat_detection_results/boat_model_v1/weights/best.pt"
+
+# ─── LOAD MODELS ──────────────────────────────────────────────────────────────
+
+print("Loading models...")
+gate_model        = YOLO(str(GATE_MODEL_PATH))
+orientation_model = YOLO(str(ORIENTATION_MODEL_PATH))
+boat_model        = YOLO(str(BOAT_MODEL_PATH))
+coco_model        = YOLO("yolov8n.pt")
+print("All 4 models loaded.\n")
+
+# ─── CLASS MAPPINGS ───────────────────────────────────────────────────────────
+
+ORIENTATION_MAP = {
+    "toward_river": TOWARD_RIVER,
+    "toward_lake":  TOWARD_LAKE,
+}
+
+BOAT_ZONE_MAP = {
+    "boat_chamber":            "chamber",
+    "boat_infront_lake_gate":  "infront_lake_gate",
+    "boat_infront_river_gate": "infront_river_gate",
+    "boat_lake_waiting":       "lake_waiting",
+    "boat_river_waiting":      "river_waiting",
+}
+
+COCO_BOAT_CLASS = 8
+
+# ─── ZONE COORDINATES — 2528x1696 images ─────────────────────────────────────
+CHAMBER_ZONE       = (1088, 252, 1353, 941)
+LAKE_WAITING_ZONE  = (112, 0, 928, 1100)
+RIVER_WAITING_ZONE = (112, 1215, 1069, 1568)
+
+# ─── GATE CROP FUNCTION ───────────────────────────────────────────────────────
+
+def crop_gate(image_path, gate="lake", log=None):
+    img = Image.open(image_path)
+
+    if gate == "lake":
+        x_min = 1119
+        x_max = 1336
+        y_min = 287
+        y_max = 377
+    else:
+        x_min = 1050
+        x_max = 1480
+        y_min = 1090
+        y_max = 1200
+
+    crop = img.crop((x_min, y_min, x_max, y_max))
+
+    stat = ImageStat.Stat(img)
+    brightness = stat.mean[0]
+    if brightness < 60:
+        crop = ImageEnhance.Contrast(crop).enhance(3.0)
+        crop = ImageEnhance.Brightness(crop).enhance(2.5)
+        msg = f"  [night mode] brightness={round(brightness,1)} — contrast enhanced"
+        print(msg)
+        if log is not None: log.append(msg)
+
+    debug_path = f"/tmp/debug_{gate}_gate_crop.jpg"
+    crop.save(debug_path)
+    return crop
+
+# ─── GATE CLASSIFIER ──────────────────────────────────────────────────────────
+
+def classify_gate(result, gate_name, log=None):
+    names = result.names
+    probs = result.probs.data.tolist()
+    prob_map = {names[i].lower(): probs[i] for i in range(len(probs))}
+
+    open_prob    = prob_map.get("lake_gate_open", 0)    + prob_map.get("river_gate_open", 0)
+    closed_prob  = prob_map.get("lake_gate_closed", 0)  + prob_map.get("river_gate_closed", 0)
+    partial_prob = prob_map.get("lake_gate_partial", 0) + prob_map.get("river_gate_partial", 0)
+
+    msg = f"  {gate_name} gate → open:{round(open_prob*100,1)}% closed:{round(closed_prob*100,1)}% partial:{round(partial_prob*100,1)}%"
+    print(msg)
+    if log is not None: log.append(msg)
+
+    if partial_prob >= 0.05:
+        return PARTIAL, round(partial_prob * 100, 1)
+    elif open_prob >= closed_prob:
+        return OPEN, round(open_prob * 100, 1)
+    else:
+        return CLOSED, round(closed_prob * 100, 1)
+
+# ─── WAITING ZONE BOAT COUNTER ────────────────────────────────────────────────
+
+def count_waiting_boats(image_path, log=None):
+    img = Image.open(image_path)
+
+    lake_crop = img.crop(LAKE_WAITING_ZONE)
+    lake_crop_path = "/tmp/debug_lake_waiting_crop.jpg"
+    lake_crop.save(lake_crop_path)
+
+    river_crop = img.crop(RIVER_WAITING_ZONE)
+    river_crop_path = "/tmp/debug_river_waiting_crop.jpg"
+    river_crop.save(river_crop_path)
+
+    lake_result  = coco_model(lake_crop_path, verbose=False, conf=0.30)[0]
+    river_result = coco_model(river_crop_path, verbose=False, conf=0.30)[0]
+
+    lake_boats = 0
+    if lake_result.boxes is not None:
+        for box in lake_result.boxes:
+            if int(box.cls[0]) == COCO_BOAT_CLASS:
+                lake_boats += 1
+
+    river_boats = 0
+    if river_result.boxes is not None:
+        for box in river_result.boxes:
+            if int(box.cls[0]) == COCO_BOAT_CLASS:
+                river_boats += 1
+
+    for msg in [
+        f"  lake_waiting:  {lake_boats} boat(s) [COCO model]",
+        f"  river_waiting: {river_boats} boat(s) [COCO model]",
+    ]:
+        print(msg)
+        if log is not None: log.append(msg)
+
+    return lake_boats, river_boats
+
+# ─── CHAMBER FAILSAFE (COCO) ──────────────────────────────────────────────────
+
+def count_chamber_boats_coco(image_path, log=None):
+    img = Image.open(image_path)
+    chamber_crop = img.crop(CHAMBER_ZONE)
+    chamber_crop_path = "/tmp/debug_chamber_coco_crop.jpg"
+    chamber_crop.save(chamber_crop_path)
+
+    result = coco_model(chamber_crop_path, verbose=False, conf=0.20)[0]
+
+    boat_count = 0
+    toward_river_count = 0
+    toward_lake_count = 0
+    crop_height = CHAMBER_ZONE[3] - CHAMBER_ZONE[1]
+
+    if result.boxes is not None:
+        for box in result.boxes:
+            if int(box.cls[0]) == COCO_BOAT_CLASS:
+                boat_count += 1
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                cy = (y1 + y2) // 2
+                if cy > crop_height // 2:
+                    toward_river_count += 1
+                else:
+                    toward_lake_count += 1
+
+    if boat_count == 0:
+        return 0, None
+
+    orientation = TOWARD_RIVER if toward_river_count >= toward_lake_count else TOWARD_LAKE
+    msg = f"  [chamber failsafe] COCO detected {boat_count} boat(s) → {orientation}"
+    print(msg)
+    if log is not None: log.append(msg)
+    return boat_count, orientation
+
+# ─── ORIENTATION HELPER ───────────────────────────────────────────────────────
+
+def get_orientation_votes(boat_result, image_path, log=None):
+    votes = []
+    vote_details = []
+    img = Image.open(image_path)
+
+    if boat_result.boxes is not None:
+        for idx, box in enumerate(boat_result.boxes):
+            class_id   = int(box.cls[0])
+            class_name = boat_result.names[class_id].lower()
+            zone       = BOAT_ZONE_MAP.get(class_name)
+
+            if zone not in ["chamber", "infront_lake_gate", "infront_river_gate"]:
+                continue
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            pad = 10
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(img.width, x2 + pad)
+            y2 = min(img.height, y2 + pad)
+
+            boat_crop      = img.crop((x1, y1, x2, y2))
+            boat_crop_path = f"/tmp/debug_boat_{idx}_crop.jpg"
+            boat_crop.save(boat_crop_path)
+
+            or_result  = orientation_model(boat_crop_path, verbose=False)[0]
+            or_class   = or_result.names[or_result.probs.top1].lower()
+            or_conf    = round(float(or_result.probs.top1conf) * 100, 1)
+            votes.append(or_class)
+            vote_details.append({"boat": idx, "zone": zone, "orientation": or_class, "conf": or_conf})
+
+            msg = f"  Boat {idx} ({zone}): {or_class} ({or_conf}%)"
+            print(msg)
+            if log is not None: log.append(msg)
+
+    if votes:
+        r_count = votes.count("toward_river")
+        l_count = votes.count("toward_lake")
+        majority = TOWARD_RIVER if r_count >= l_count else TOWARD_LAKE
+        msg = f"  Majority vote: {majority} ({r_count} river vs {l_count} lake)"
+        print(msg)
+        if log is not None: log.append(msg)
+        return votes, majority, r_count, l_count, vote_details
+    else:
+        msg = "  No boats in relevant zones — orientation N/A"
+        print(msg)
+        if log is not None: log.append(msg)
+        return [], None, 0, 0, []
+
+# ─── INFERENCE FUNCTION ───────────────────────────────────────────────────────
+
+def run_inference(image_path):
+    log = []
+
+    def L(msg):
+        print(msg)
+        log.append(msg)
+
+    L(f"Running inference on: {Path(image_path).name}")
+    L("─" * 50)
+
+    overrides_fired = []
+
+    # ── 1. GATE CLASSIFIER ──────────────────────────────
+    L("\n[1] Gate classification:")
+    lake_crop  = crop_gate(image_path, gate="lake",  log=log)
+    river_crop = crop_gate(image_path, gate="river", log=log)
+
+    lake_crop_path  = "/tmp/lake_crop.jpg"
+    river_crop_path = "/tmp/river_crop.jpg"
+    lake_crop.save(lake_crop_path)
+    river_crop.save(river_crop_path)
+
+    lake_result  = gate_model(lake_crop_path, verbose=False)[0]
+    river_result = gate_model(river_crop_path, verbose=False)[0]
+
+    lake_gate,  lake_conf  = classify_gate(lake_result,  "lake",  log=log)
+    river_gate, river_conf = classify_gate(river_result, "river", log=log)
+
+    raw_lake_gate  = lake_gate
+    raw_river_gate = river_gate
+
+    # ── 2. BOAT DETECTION ───────────────────────────────
+    L("\n[2] Boat detection (chamber + infront zones):")
+    boat_result = boat_model(image_path, verbose=False, conf=0.30)[0]
+
+    zone_counts = {
+        "chamber":            0,
+        "infront_lake_gate":  0,
+        "infront_river_gate": 0,
+        "lake_waiting":       0,
+        "river_waiting":      0,
+    }
+
+    if boat_result.boxes is not None:
+        for box in boat_result.boxes:
+            class_id   = int(box.cls[0])
+            class_name = boat_result.names[class_id].lower()
+            conf       = round(float(box.conf[0]) * 100, 1)
+            zone       = BOAT_ZONE_MAP.get(class_name)
+            if zone and zone not in ["lake_waiting", "river_waiting"]:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                in_chamber       = (CHAMBER_ZONE[0] <= cx <= CHAMBER_ZONE[2] and
+                                    CHAMBER_ZONE[1] <= cy <= CHAMBER_ZONE[3])
+                in_lake_waiting  = (LAKE_WAITING_ZONE[0] <= cx <= LAKE_WAITING_ZONE[2] and
+                                    LAKE_WAITING_ZONE[1] <= cy <= LAKE_WAITING_ZONE[3])
+                in_river_waiting = (RIVER_WAITING_ZONE[0] <= cx <= RIVER_WAITING_ZONE[2] and
+                                    RIVER_WAITING_ZONE[1] <= cy <= RIVER_WAITING_ZONE[3])
+                if (in_lake_waiting or in_river_waiting) and not in_chamber:
+                    msg = f"  Skipped: {class_name} ({conf}%) — center in waiting zone"
+                    print(msg); log.append(msg)
+                    continue
+                msg = f"  Detected: {class_name} ({conf}%)"
+                print(msg); log.append(msg)
+                zone_counts[zone] += 1
+
+    # ── 2b. WAITING ZONE DETECTION (COCO model) ─────────
+    L("\n[2b] Waiting zone detection (COCO pretrained):")
+    lake_waiting, river_waiting = count_waiting_boats(image_path, log=log)
+    zone_counts["lake_waiting"]  = lake_waiting
+    zone_counts["river_waiting"] = river_waiting
+
+    L("\n  Zone summary:")
+    for zone, count in zone_counts.items():
+        L(f"  {zone}: {count}")
+
+    # ── 2c. CHAMBER FAILSAFE (COCO) ─────────────────────
+    coco_chamber_orientation = None
+    chamber_failsafe_used = False
+    if zone_counts["chamber"] == 0:
+        L("\n[2c] Chamber failsafe (COCO):")
+        coco_chamber_count, coco_chamber_orientation = count_chamber_boats_coco(image_path, log=log)
+        if coco_chamber_count > 0:
+            zone_counts["chamber"] = coco_chamber_count
+            chamber_failsafe_used = True
+            msg = f"  Chamber updated: {coco_chamber_count} boat(s) → {coco_chamber_orientation}"
+            print(msg); log.append(msg)
+
+    # ── 3. ORIENTATION MODEL ────────────────────────────
+    L("\n[3] Orientation classification:")
+    votes, raw_orientation, r_count, l_count, vote_details = get_orientation_votes(boat_result, image_path, log=log)
+
+    # ── 4. PHYSICS-BASED GATE OVERRIDES ─────────────────
+    L("\n[4] Physics-based gate overrides:")
+
+    def override(msg):
+        print(f"  [override] {msg}")
+        log.append(f"  [override] {msg}")
+
+    if lake_gate == PARTIAL and river_gate == PARTIAL and lake_conf < 30 and river_conf < 30:
+        lake_gate = CLOSED
+        river_gate = CLOSED
+        overrides_fired.append("Override 0: Both partial too low → both CLOSED")
+        override(f"Both partial scores too low ({lake_conf}% / {river_conf}%) — both forced CLOSED")
+
+    if lake_gate == OPEN and river_gate == OPEN:
+        if raw_orientation == TOWARD_LAKE:
+            river_gate = CLOSED
+            overrides_fired.append("Override 0b: Both open + toward_lake → river CLOSED")
+            override("Both open + boats toward_lake — river forced CLOSED")
+        elif raw_orientation == TOWARD_RIVER:
+            lake_gate = CLOSED
+            overrides_fired.append("Override 0b: Both open + toward_river → lake CLOSED")
+            override("Both open + boats toward_river — lake forced CLOSED")
+        else:
+            if lake_conf >= river_conf:
+                river_gate = CLOSED
+                overrides_fired.append("Override 0b: Both open, no orientation → river CLOSED")
+                override("Both open, no orientation — river forced CLOSED")
+            else:
+                lake_gate = CLOSED
+                overrides_fired.append("Override 0b: Both open, no orientation → lake CLOSED")
+                override("Both open, no orientation — lake forced CLOSED")
+
+    if lake_gate == PARTIAL and river_gate == PARTIAL:
+        if lake_conf >= river_conf:
+            river_gate = CLOSED
+            overrides_fired.append("Override 1: Both partial → river CLOSED")
+            override(f"Both partial — river forced CLOSED (lake {lake_conf}% > river {river_conf}%)")
+        else:
+            lake_gate = CLOSED
+            overrides_fired.append("Override 1: Both partial → lake CLOSED")
+            override(f"Both partial — lake forced CLOSED (river {river_conf}% > lake {lake_conf}%)")
+
+    if lake_gate == PARTIAL and river_gate == OPEN:
+        if river_conf >= 95:
+            lake_gate = CLOSED
+            overrides_fired.append("Override 5: Lake partial + river open (trusted) → lake CLOSED")
+            override(f"Lake partial + river open ({river_conf}%) — lake forced CLOSED (river trusted)")
+        elif raw_orientation == TOWARD_RIVER:
+            river_gate = PARTIAL
+            overrides_fired.append("Override 5: Lake partial + river open + toward_river → river PARTIAL")
+            override(f"Lake partial + river open ({river_conf}%) + boats toward_river — river forced PARTIAL")
+        else:
+            river_gate = CLOSED
+            overrides_fired.append("Override 5: Lake partial + river open → river CLOSED")
+            override(f"Lake partial + river open ({river_conf}%) — river forced CLOSED")
+
+    if river_gate == PARTIAL and lake_gate == OPEN:
+        if lake_conf >= 95:
+            river_gate = CLOSED
+            overrides_fired.append("Override 6: River partial + lake open (trusted) → river CLOSED")
+            override(f"River partial + lake open ({lake_conf}%) — river forced CLOSED (lake trusted)")
+        elif raw_orientation == TOWARD_LAKE:
+            lake_gate = PARTIAL
+            overrides_fired.append("Override 6: River partial + lake open + toward_lake → lake PARTIAL")
+            override(f"River partial + lake open ({lake_conf}%) + boats toward_lake — lake forced PARTIAL")
+        else:
+            lake_gate = CLOSED
+            overrides_fired.append("Override 6: River partial + lake open → lake CLOSED")
+            override(f"River partial + lake open ({lake_conf}%) — lake forced CLOSED")
+
+    if raw_orientation is not None:
+        if raw_orientation == TOWARD_LAKE and river_gate == PARTIAL:
+            river_gate = CLOSED
+            overrides_fired.append("Override 2: toward_lake + river partial → river CLOSED")
+            override("Boats toward_lake + river partial — river forced CLOSED")
+        if raw_orientation == TOWARD_RIVER and lake_gate == PARTIAL:
+            lake_gate = CLOSED
+            overrides_fired.append("Override 2: toward_river + lake partial → lake CLOSED")
+            override("Boats toward_river + lake partial — lake forced CLOSED")
+
+    if river_gate == OPEN and lake_gate == PARTIAL:
+        lake_gate = CLOSED
+        overrides_fired.append("Override 3: River open + lake partial → lake CLOSED")
+        override("River open + lake partial — lake forced CLOSED")
+
+    if lake_gate == OPEN and river_gate == PARTIAL:
+        river_gate = CLOSED
+        overrides_fired.append("Override 4: Lake open + river partial → river CLOSED")
+        override("Lake open + river partial — river forced CLOSED")
+
+    if not overrides_fired:
+        msg = "  No overrides fired — clean inference"
+        print(msg); log.append(msg)
+
+    L(f"  Final → Lake gate: {lake_gate} ({lake_conf}%) | River gate: {river_gate} ({river_conf}%)")
+
+    # ── 5. APPLY ORIENTATION TO ZONES ───────────────────
+    if coco_chamber_orientation is not None:
+        chamber_orientation = coco_chamber_orientation
+    else:
+        chamber_orientation = raw_orientation if zone_counts["chamber"] > 0 else None
+
+    infront_lake_orientation  = raw_orientation if zone_counts["infront_lake_gate"] > 0 else None
+    infront_river_orientation = raw_orientation if zone_counts["infront_river_gate"] > 0 else None
+
+    # ── 6. REASONING LAYER ──────────────────────────────
+    result = classify_lock_state(
+        lake_gate=lake_gate,
+        river_gate=river_gate,
+        chamber_boats=zone_counts["chamber"],
+        chamber_orientation=chamber_orientation,
+        infront_lake_boats=zone_counts["infront_lake_gate"],
+        infront_lake_orientation=infront_lake_orientation,
+        infront_river_boats=zone_counts["infront_river_gate"],
+        infront_river_orientation=infront_river_orientation,
+        lake_waiting_boats=zone_counts["lake_waiting"],
+        river_waiting_boats=zone_counts["river_waiting"],
+    )
+
+    print(f"\n{'─' * 50}")
+    print(f"PREDICTED STATE:  {result['state']}")
+    print(f"CONFIDENCE:       {result['confidence']}% ({result['confidence_flag']})")
+    print(f"REASON:           {result['reason']}")
+    print(f"{'─' * 50}\n")
+
+    # ── RETURN RICH RESULT ──────────────────────────────
+    return {
+        "state":             result["state"],
+        "confidence":        result["confidence"],
+        "confidence_flag":   result["confidence_flag"],
+        "reason":            result["reason"],
+        "raw_lake_gate":     raw_lake_gate,
+        "raw_river_gate":    raw_river_gate,
+        "final_lake_gate":   lake_gate,
+        "final_river_gate":  river_gate,
+        "lake_conf":         lake_conf,
+        "river_conf":        river_conf,
+        "overrides_fired":   overrides_fired,
+        "override_count":    len(overrides_fired),
+        "zone_counts":       zone_counts,
+        "chamber_failsafe":  chamber_failsafe_used,
+        "orientation_votes":      vote_details,
+        "majority_orientation":   raw_orientation,
+        "toward_river_count":     r_count,
+        "toward_lake_count":      l_count,
+        "total_orientation_boats": r_count + l_count,
+        "inference_log":     log,
+    }
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    test_image = BASE / "DEMO CAROSEL IMAGE SET/slot_40_EXITING_LAKE_FOGGY_CLEAR_0810PM.png"
+    run_inference(str(test_image))
